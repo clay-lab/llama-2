@@ -16,8 +16,8 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 
-from llama.model import ModelArgs, Transformer
-from llama.tokenizer import Tokenizer
+from llama_2.model import ModelArgs, Transformer
+from llama_2.tokenizer import Tokenizer
 
 Role = Literal["system", "user", "assistant"]
 
@@ -66,7 +66,7 @@ class Llama:
             initialize_model_parallel(model_parallel_size)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
+        # torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
         torch.manual_seed(1)
@@ -92,7 +92,8 @@ class Llama:
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
-        torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        # torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        torch.set_default_tensor_type(torch.BFloat16Tensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
@@ -103,6 +104,77 @@ class Llama:
         self.model = model
         self.tokenizer = tokenizer
 
+    def num_parameters(self) -> int:
+        return round(sum(p.numel() for p in self.model.parameters() if p.requires_grad))
+
+    @torch.inference_mode()
+    def __call__(self, tokens: torch.Tensor):
+        '''
+        Returns logits for the next token for each example
+        in a batch of tokens.
+        '''
+        # we need to pad by at least one so that we get the right position for the
+        # longest sentence in the batch
+        tokens = F.pad(tokens, pad=(0, 1), value=self.tokenizer.pad_id)
+        each_prompt_size = sorted([
+            min((t == self.tokenizer.pad_id).nonzero(as_tuple=True)[0]).item() for t in tokens
+        ])
+        
+        min_prompt_size = each_prompt_size[0]
+        max_prompt_size = each_prompt_size[-1]
+        
+        total_len = max_prompt_size + 1
+        
+        input_mask = tokens != self.tokenizer.pad_id
+        
+        start_pos = min_prompt_size
+        prev_pos = 0
+        
+        keep_logits = torch.tensor(())
+        
+        for cur_pos in range(start_pos, total_len):
+            _logits = self.model.forward(tokens=tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            
+            # this gets run the first time through the loop
+            # to initialize the tensor we'll use to store
+            # the logits for the next token for each example
+            if keep_logits.shape[0] == 0:
+                keep_logits = _logits
+            
+            # if the prompts are of unequal length,
+            # we want to get the logits for the next position for each prompt
+            if not torch.all(input_mask):
+                # get the inputs for which we want the logits.
+                # these are the ones where the input_mask is False,
+                # because that corresponds to the previous token
+                # being the end of the input
+                keep = torch.where(
+                    torch.all(
+                        torch.stack(
+                            (
+                                input_mask[:, cur_pos-1],
+                                input_mask[:, cur_pos] == False
+                            ),
+                            dim=-1
+                        ),
+                        dim=-1
+                    )
+                )
+                
+                keep_logits[keep] = _logits[keep]
+                
+                next_token = torch.full((_logits.shape[0],), self.tokenizer.eos_id)
+                
+                # only replace token if prompt has already been generated
+                next_token = torch.where(
+                    input_mask[:, cur_pos], tokens[:, cur_pos], next_token
+                )
+                tokens[:, cur_pos] = next_token
+            
+            prev_pos = cur_pos
+        
+        return keep_logits
+    
     @torch.inference_mode()
     def generate(
         self,
@@ -123,14 +195,16 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        # tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            # tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long)
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz)#, device="cuda")
         input_text_mask = tokens != pad_id
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
