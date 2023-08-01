@@ -12,6 +12,6 @@ source activate llama-2
 
 time python \
     example_chat_completion.py \
-    --ckpt_dir facebook/llama-2/llama-2-7b \
+    --ckpt_dir facebook/llama-2/llama-2-7b-chat \
     --tokenizer_path facebook/llama-2/tokenizer.model \
     --max_batch_size 2
